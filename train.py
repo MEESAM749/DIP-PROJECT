@@ -3,228 +3,272 @@ import numpy as np
 import sys
 from ultralytics import YOLO
 import concurrent.futures
+import torch
 
-# Load the YOLO model for dynamic obstacle detection
+# --- Tunable constants ---
+ROI_TOP        = 0.60   # Horizon as fraction of height
+SLOPE_MIN      = 0.50   # Reject near-horizontal lines
+SLOPE_MAX      = 2.50   # Reject near-vertical noise
+HOUGH_THRESH   = 30
+MIN_LINE_LEN   = 30
+MAX_LINE_GAP   = 150
+EMA_ALPHA      = 0.25   # Temporal smoothing for lane center
+STEER_MARGIN   = 0.05   # Fraction of width for dead-zone
+STOP_DEFAULTS  = {0: 0.08, 2: 0.15, 3: 0.15, 5: 0.18, 7: 0.20}  # class: area ratio
+
 print("Loading YOLO model...")
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
 model = YOLO("yolov8n.pt")
+model.to(device)
 print("Model loaded.")
 
-def preprocess_image(frame):
-    """
-    Applies contrast enhancement and color space conversion to make 
-    lane lines pop out regardless of lighting conditions.
-    """
-    # 1. Contrast Enhancement (CLAHE) - handles uneven lighting
+_smoothed_center = None  # Module-level EMA state
+
+
+def preprocess_image(frame, roi_top=ROI_TOP):
+    """CLAHE enhancement restricted to the road ROI."""
+    height, width = frame.shape[:2]
+    roi_y = int(height * roi_top)
+
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    enhanced_frame = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-    
-    return enhanced_frame
 
-def detect_lanes_robust(frame):
-    """
-    Robust lane detection using color segmentation, morphological operations,
-    Canny edge detection, and polynomial fitting for curved lanes.
-    """
+    # Apply CLAHE only on road region
+    l[roi_y:] = clahe.apply(l[roi_y:])
+
+    limg = cv2.merge((l, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+
+def _fit_lane_line(xs, ys):
+    """Linear polyfit with outlier rejection via IQR on x-values."""
+    if len(ys) < 6:
+        return None
+    xs, ys = np.array(xs), np.array(ys)
+    q1, q3 = np.percentile(xs, 25), np.percentile(xs, 75)
+    iqr = q3 - q1
+    mask = (xs >= q1 - 1.5 * iqr) & (xs <= q3 + 1.5 * iqr)
+    if mask.sum() < 6:
+        return None
+    return np.polyfit(ys[mask], xs[mask], 1)  # linear, not quadratic
+
+
+def _eval_fit_center(fit, y_bottom, y_top):
+    """Average x across the lower portion of the lane fit."""
+    ys = np.linspace(y_top, y_bottom, 20)
+    return int(np.mean(np.polyval(fit, ys)))
+
+
+def detect_lanes(frame):
+    global _smoothed_center
     height, width = frame.shape[:2]
-    
-    # 1. Convert to HLS color space for better white/yellow extraction
+
+    # Color masking in HLS
     hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-    
-    # Define thresholds for White and Yellow lanes
-    lower_white = np.array([0, 200, 0], dtype=np.uint8)
-    upper_white = np.array([255, 255, 255], dtype=np.uint8)
-    white_mask = cv2.inRange(hls, lower_white, upper_white)
-    
-    lower_yellow = np.array([10, 0, 100], dtype=np.uint8)
-    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
-    yellow_mask = cv2.inRange(hls, lower_yellow, upper_yellow)
-    
-    # Combine masks
+    white_mask  = cv2.inRange(hls, np.array([0, 200, 0],   np.uint8),
+                                   np.array([255, 255, 255], np.uint8))
+    yellow_mask = cv2.inRange(hls, np.array([10, 0, 100],  np.uint8),
+                                   np.array([40, 255, 255], np.uint8))
     combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
-    
-    # 2. Morphological Closing to fill gaps in lane lines
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-    
-    # 3. Spatial Filtering & Edge Detection
-    blurred = cv2.GaussianBlur(closed_mask, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    
-    # 4. Region of Interest (ROI) Masking
-    mask = np.zeros_like(edges)
-    polygon = np.array([[
-        (int(width * 0.1), height),
-        (int(width * 0.40), int(height * 0.6)),
-        (int(width * 0.60), int(height * 0.6)),
-        (int(width * 0.9), height)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+
+    blurred = combined_mask#cv2.GaussianBlur(combined_mask, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 50, 150)
+
+    # ROI mask
+    roi_top = int(height * ROI_TOP)
+    poly = np.array([[
+        (int(width * 0.10), height),
+        (int(width * 0.40), roi_top),
+        (int(width * 0.60), roi_top),
+        (int(width * 0.90), height),
     ]], np.int32)
-    cv2.fillPoly(mask, polygon, 255)
-    masked_edges = cv2.bitwise_and(edges, mask)
-    
-    # 5. Hough Transform
-    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, 30, 
-                            minLineLength=20, maxLineGap=100)
-    
-    # 6. Polynomial Fitting for Curved Roads
+    roi_mask = np.zeros_like(edges)
+    cv2.fillPoly(roi_mask, poly, 255)
+    masked_edges = cv2.bitwise_and(edges, roi_mask)
+
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, HOUGH_THRESH,
+                            minLineLength=MIN_LINE_LEN, maxLineGap=MAX_LINE_GAP)
+
     left_x, left_y, right_x, right_y = [], [], [], []
-    
     if lines is not None:
         for line in lines:
-            for x1, y1, x2, y2 in line:
-                slope = (y2 - y1) / (x2 - x1 + 1e-6) # Avoid division by zero
-                if abs(slope) < 0.3: continue # Ignore near-horizontal lines
-                
-                if slope < 0: # Left lane
-                    left_x.extend([x1, x2])
-                    left_y.extend([y1, y2])
-                else:         # Right lane
-                    right_x.extend([x1, x2])
-                    right_y.extend([y1, y2])
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            if abs(slope) < SLOPE_MIN or abs(slope) > SLOPE_MAX:
+                continue
+            if slope < 0:
+                left_x.extend([x1, x2]);  left_y.extend([y1, y2])
+            else:
+                right_x.extend([x1, x2]); right_y.extend([y1, y2])
 
-    # Fit a 2nd degree polynomial (curve) if we have enough points, otherwise linear
-    left_fit = np.polyfit(left_y, left_x, 2) if len(left_y) > 5 else None
-    right_fit = np.polyfit(right_y, right_x, 2) if len(right_y) > 5 else None
-    
-    # Calculate target center at the bottom of the frame
-    bottom_y = height
-    target_left_x = int(np.polyval(left_fit, bottom_y)) if left_fit is not None else 0
-    target_right_x = int(np.polyval(right_fit, bottom_y)) if right_fit is not None else width
-    
-    lane_center_x = (target_left_x + target_right_x) // 2
-    
-    return lines, lane_center_x, masked_edges
+    left_fit  = _fit_lane_line(left_x,  left_y)
+    right_fit = _fit_lane_line(right_x, right_y)
+
+    lane_lost = left_fit is None and right_fit is None
+
+    if not lane_lost:
+        y_bottom = height
+        y_eval   = int(height * 0.70)  # average center across lower 30%
+
+        if left_fit is not None and right_fit is not None:
+            raw_center = (_eval_fit_center(left_fit,  y_bottom, y_eval) +
+                          _eval_fit_center(right_fit, y_bottom, y_eval)) // 2
+        elif left_fit is not None:
+            raw_center = _eval_fit_center(left_fit, y_bottom, y_eval) + width // 4
+        else:
+            raw_center = _eval_fit_center(right_fit, y_bottom, y_eval) - width // 4
+
+        # Temporal EMA smoothing
+        if _smoothed_center is None:
+            _smoothed_center = raw_center
+        else:
+            _smoothed_center = int(EMA_ALPHA * raw_center +
+                                   (1 - EMA_ALPHA) * _smoothed_center)
+
+    return lines, _smoothed_center, masked_edges, lane_lost
+
 
 def detect_obstacles(rgb_img):
-    """
-    Detects dynamic obstacles using YOLOv8 and calculates relative size 
-    to trigger braking mechanism.
-    """
     results = model(rgb_img, verbose=False)[0]
-    boxes = results.boxes
-    bboxes = []
-    stop_flag = False
-
     height, width, _ = rgb_img.shape
-
-    for box in boxes:
+    bboxes, stop_flag = [], False
+    for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cls = int(box.cls[0])
+        cls  = int(box.cls[0])
         conf = float(box.conf[0])
+        if cls not in STOP_DEFAULTS or conf <= 0.50:
+            continue
+        bboxes.append((x1, y1, x2, y2, cls))
 
-        # Filter for vehicles and pedestrians (COCO classes: 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck)
-        if cls in [0, 2, 3, 5, 7] and conf > 0.50:
-            bboxes.append((x1, y1, x2, y2, cls))
+        box_area   = (x2 - x1) * (y2 - y1)
+        frame_area = width * height
+        area_ratio = box_area / frame_area
+        proximity  = y2 / height  # 1.0 = bottom of frame = close
 
-            # Proximity heuristic based on bounding box area
-            box_area = (x2 - x1) * (y2 - y1)
-            frame_area = width * height
-
-            # If the object takes up more than 15% of the frame and is in our direct path
-            if (box_area / frame_area) > 0.15:
-                if x2 > width * 0.25 and x1 < width * 0.75:
-                    stop_flag = True
+        threshold = STOP_DEFAULTS[cls]
+        if area_ratio > threshold and proximity > 0.5:
+            if x2 > width * 0.25 and x1 < width * 0.75:
+                stop_flag = True
 
     return bboxes, stop_flag
 
-def draw_hud(frame, lines, lane_center_x, bboxes, decision, color, masked_edges):
-    """Draws heads-up display (HUD) and debug information."""
+
+def draw_hud(frame, lines, lane_center_x, bboxes, decision,
+             color, masked_edges, lane_lost, steering_offset):
     height, width = frame.shape[:2]
     frame_center_x = width // 2
 
-    # Draw detected raw hough lines for debugging
     if lines is not None:
         for line in lines:
-            for x1, y1, x2, y2 in line:
-                cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            x1, y1, x2, y2 = line[0]
+            cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-    # Draw steering center markers
-    cv2.circle(frame, (lane_center_x, height - 50), 10, (0, 255, 0), -1) # Desired path
-    cv2.circle(frame, (frame_center_x, height - 50), 10, (0, 0, 255), -1) # Car center
-    cv2.line(frame, (frame_center_x, height - 50), (lane_center_x, height - 50), (255, 255, 255), 2)
+    if not lane_lost and lane_center_x is not None:
+        cv2.circle(frame, (lane_center_x, height - 50), 10, (0, 255, 0), -1)
+        cv2.line(frame, (frame_center_x, height - 50),
+                         (lane_center_x, height - 50), (255, 255, 255), 2)
 
-    # Draw Obstacles
+    cv2.circle(frame, (frame_center_x, height - 50), 10, (0, 0, 255), -1)
+
     for x1, y1, x2, y2, cls in bboxes:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(frame, "OBSTACLE", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(frame, "OBSTACLE", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-    # Action Output
-    cv2.rectangle(frame, (10, 10), (500, 70), (0, 0, 0), -1)
-    cv2.putText(frame, f"ACTION: {decision}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+    cv2.rectangle(frame, (10, 10), (560, 100), (0, 0, 0), -1)
+    cv2.putText(frame, f"ACTION: {decision}", (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+    cv2.putText(frame, f"Steer offset: {steering_offset:+.3f}", (20, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    # Debug edge mask inset
+    debug = cv2.cvtColor(masked_edges, cv2.COLOR_GRAY2BGR)
+    dw, dh = int(width * 0.3), int(height * 0.3)
+    debug = cv2.resize(debug, (dw, dh))
+    frame[10:10 + dh, width - dw - 10:width - 10] = debug
+    cv2.putText(frame, "Edge Mask", (width - dw - 10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     return frame
 
-def main():
-    source = sys.argv[1] if len(sys.argv) > 1 else "0"
-    
-    if source.isdigit():
-        cap = cv2.VideoCapture(int(source))
-    else:
-        cap = cv2.VideoCapture(source)
 
+def main():
+    global _smoothed_center
+    source = sys.argv[1] if len(sys.argv) > 1 else "0"
+    cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
     if not cap.isOpened():
         print(f"Error: could not open source '{source}'")
         sys.exit(1)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 30
     delay = max(1, int(1000 / fps))
-
     print(f"Streaming from '{source}' at {fps:.1f} fps. Press 'q' to quit.")
 
-    # PC Optimization: Parallel Execution
+    last_decision = "FORWARD"
+    last_color    = (0, 255, 0)
+    frame_count   = 0
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         while True:
             ret, frame = cap.read()
-            if not ret: break
-            
-            # Pre-process for robust lighting adaptation
-            enhanced_frame = preprocess_image(frame)
+            if not ret:
+                break
+            frame = cv2.resize(frame, (640, 360))
+            enhanced = preprocess_image(frame)
+            f_lanes  = executor.submit(detect_lanes, enhanced)
+            f_obs    = executor.submit(detect_obstacles, frame)
 
-            # Submit parallel tasks for Hybrid Vision System
-            future_lanes = executor.submit(detect_lanes_robust, enhanced_frame)
-            future_obstacles = executor.submit(detect_obstacles, frame)
+            lines, lane_center_x, masked_edges, lane_lost = f_lanes.result()
+            if frame_count % 3 == 0:
+                f_obs = executor.submit(detect_obstacles, frame)
+                bboxes, stop_flag = f_obs.result()
+            frame_count += 1
 
-            # Gather results
-            lines, lane_center_x, masked_edges = future_lanes.result()
-            bboxes, stop_flag = future_obstacles.result()
-
-            # Directional Control Logic
-            height, width = frame.shape[:2]
+            height, width  = frame.shape[:2]
             frame_center_x = width // 2
-            steering_margin = int(width * 0.05) 
+            margin         = int(width * STEER_MARGIN)
 
-            decision = "FORWARD"
-            color = (0, 255, 0)
+            # Proportional steering offset in [-1, 1]
+            if lane_lost or lane_center_x is None:
+                steering_offset = 0.0
+                decision = "LANE LOST — HOLD"
+                color    = (0, 165, 255)
+            else:
+                steering_offset = (lane_center_x - frame_center_x) / (width * 0.5)
 
-            if stop_flag:
-                decision = "STOP - OBSTACLE"
-                color = (0, 0, 255)
-            elif lane_center_x < (frame_center_x - steering_margin):
-                decision = "TURN LEFT"
-                color = (255, 255, 0)
-            elif lane_center_x > (frame_center_x + steering_margin):
-                decision = "TURN RIGHT"
-                color = (0, 255, 255)
+                if stop_flag:
+                    decision = "STOP — OBSTACLE"
+                    color    = (0, 0, 255)
+                elif lane_center_x < frame_center_x - margin:
+                    decision = "TURN LEFT"
+                    color    = (255, 255, 0)
+                elif lane_center_x > frame_center_x + margin:
+                    decision = "TURN RIGHT"
+                    color    = (0, 255, 255)
+                else:
+                    decision = "FORWARD"
+                    color    = (0, 255, 0)
 
-            # Display Output and Debugging
-            display = draw_hud(frame.copy(), lines, lane_center_x, bboxes, decision, color, masked_edges)
-            
-            # Show a picture-in-picture debug view of the edge detection
-            debug_view = cv2.cvtColor(masked_edges, cv2.COLOR_GRAY2BGR)
-            debug_view = cv2.resize(debug_view, (int(width * 0.3), int(height * 0.3)))
-            display[10:10+debug_view.shape[0], width-debug_view.shape[1]-10:width-10] = debug_view
-            cv2.putText(display, "Edge Mask Debug", (width-debug_view.shape[1]-10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                last_decision = decision
+                last_color    = color
 
+            display = draw_hud(frame.copy(), lines, lane_center_x, bboxes,
+                               decision, color, masked_edges,
+                               lane_lost, steering_offset)
             cv2.imshow("Hybrid Vision System", display)
-
             if cv2.waitKey(delay) & 0xFF == ord('q'):
                 break
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
